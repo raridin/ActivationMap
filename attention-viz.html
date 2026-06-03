@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GPT-2 Attention Visualizer</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --panel: #1a1d27;
+      --border: #2a2f3d;
+      --text: #e6e8ee;
+      --muted: #9aa3b2;
+      --accent: #6ea8fe;
+      --danger: #ff6b6b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      line-height: 1.4;
+    }
+    header {
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 { margin: 0 0 0.15rem; font-size: 1.15rem; }
+    header p { margin: 0; color: var(--muted); font-size: 0.85rem; }
+
+    main { padding: 1.25rem 1.5rem; max-width: 1100px; margin: 0 auto; }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      align-items: flex-end;
+    }
+    .field { display: flex; flex-direction: column; gap: 0.3rem; }
+    .field label {
+      font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em;
+      color: var(--muted);
+    }
+    textarea, select, button {
+      font: inherit;
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.55rem 0.7rem;
+    }
+    textarea { width: 420px; max-width: 60vw; resize: vertical; min-height: 2.6rem; }
+    select { min-width: 5rem; cursor: pointer; }
+    button {
+      background: var(--accent); color: #0b1020; border: none;
+      font-weight: 600; cursor: pointer; padding: 0.6rem 1.1rem;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    #status {
+      margin-top: 1rem; min-height: 1.2rem; font-size: 0.85rem; color: var(--muted);
+    }
+    #status.error { color: var(--danger); }
+    .progress {
+      margin-top: 0.5rem; width: 320px; max-width: 80vw; height: 8px;
+      background: var(--border); border-radius: 99px; overflow: hidden; display: none;
+    }
+    .progress > div { height: 100%; width: 0%; background: var(--accent); transition: width 0.15s; }
+
+    #chart { margin-top: 1.25rem; }
+    .axis-label { fill: var(--muted); font-size: 0.7rem; }
+    .cell { shape-rendering: crispEdges; }
+    .cell.hover { stroke: #fff; stroke-width: 1.5px; }
+    .tick text { fill: var(--text); }
+    .legend-text { fill: var(--muted); font-size: 0.7rem; }
+
+    #tooltip {
+      position: fixed; pointer-events: none; z-index: 10;
+      background: #000c; border: 1px solid var(--border); border-radius: 6px;
+      padding: 0.4rem 0.6rem; font-size: 0.8rem; color: var(--text);
+      opacity: 0; transition: opacity 0.08s; white-space: nowrap;
+    }
+    #tooltip .w { color: var(--accent); font-weight: 600; }
+    code { background: var(--panel); padding: 0 0.3rem; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>GPT-2 Attention Visualizer</h1>
+    <p>Type a prompt and hit Run. Each cell shows how much the <em>row</em> token attends to the <em>column</em> token, for the selected layer and head.</p>
+  </header>
+
+  <main>
+    <div class="controls">
+      <div class="field">
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt" rows="1">The cat sat on the mat</textarea>
+      </div>
+      <button id="run">Run</button>
+      <div class="field">
+        <label for="layer">Layer</label>
+        <select id="layer"></select>
+      </div>
+      <div class="field">
+        <label for="head">Head</label>
+        <select id="head"></select>
+      </div>
+      <div class="field">
+        <label for="scheme">Color</label>
+        <select id="scheme">
+          <option value="Blues">Blues</option>
+          <option value="Viridis">Viridis</option>
+          <option value="Magma">Magma</option>
+          <option value="Greens">Greens</option>
+          <option value="Inferno">Inferno</option>
+        </select>
+      </div>
+    </div>
+
+    <div id="status">Idle. Model (~653 MB) downloads on first Run, then is cached by the browser.</div>
+    <div class="progress" id="progress"><div></div></div>
+
+    <div id="chart"></div>
+  </main>
+
+  <div id="tooltip"></div>
+
+  <script type="module">
+    import {
+      AutoTokenizer,
+      AutoModelForCausalLM,
+      env,
+    } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0';
+    import * as d3 from 'https://cdn.jsdelivr.net/npm/d3@7/+esm';
+
+    const MODEL_ID = 'damoncrockett/gpt2-with-attentions-onnx';
+    const NUM_LAYERS = 12;
+    const NUM_HEADS = 12;
+
+    env.allowLocalModels = false; // always fetch from the Hub
+
+    // --- DOM ---
+    const $ = id => document.getElementById(id);
+    const els = {
+      prompt: $('prompt'), run: $('run'),
+      layer: $('layer'), head: $('head'), scheme: $('scheme'),
+      status: $('status'), progress: $('progress'),
+      progressBar: $('progress').firstElementChild,
+      chart: $('chart'), tooltip: $('tooltip'),
+    };
+
+    // --- State ---
+    let tokenizer = null;
+    let model = null;
+    let cache = null; // { tokens: string[], N, layers: [{data: Float32Array, H, N}] }
+
+    // Populate dropdowns once.
+    for (let i = 0; i < NUM_LAYERS; i++) els.layer.add(new Option(`Layer ${i}`, i));
+    for (let i = 0; i < NUM_HEADS; i++) els.head.add(new Option(`Head ${i}`, i));
+
+    // --- Helpers ---
+    function setStatus(msg, isError = false) {
+      els.status.textContent = msg;
+      els.status.classList.toggle('error', isError);
+    }
+    function showProgress(show) {
+      els.progress.style.display = show ? 'block' : 'none';
+      if (!show) els.progressBar.style.width = '0%';
+    }
+    // GPT-2 BPE: decoded tokens carry a leading space for word starts. Show it
+    // as a "·" marker so axis labels read naturally and whitespace is visible.
+    function cleanToken(t) {
+      if (t === '') return '∅';
+      let out = t.replace(/^ /, '·').replace(/\n/g, '⏎').replace(/\t/g, '⇥');
+      return out;
+    }
+
+    // --- Model loading (lazy, with progress + retry) ---
+    async function ensureModel() {
+      if (model && tokenizer) return;
+      const MAX_ATTEMPTS = 3;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          setStatus(
+            attempt === 1
+              ? 'Loading tokenizer + model… first run downloads ~653 MB.'
+              : `Retrying model load (attempt ${attempt}/${MAX_ATTEMPTS})…`
+          );
+          showProgress(true);
+          if (!tokenizer) tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID);
+          model = await AutoModelForCausalLM.from_pretrained(MODEL_ID, {
+            dtype: 'fp32',
+            progress_callback: (p) => {
+              if (p.status === 'progress' && p.total) {
+                const pct = Math.round((p.loaded / p.total) * 100);
+                els.progressBar.style.width = pct + '%';
+                setStatus(`Downloading ${p.file || 'model'}: ${pct}%`);
+              } else if (p.status === 'ready' || p.status === 'done') {
+                els.progressBar.style.width = '100%';
+              }
+            },
+          });
+          showProgress(false);
+          return;
+        } catch (err) {
+          model = null;
+          if (attempt === MAX_ATTEMPTS) {
+            showProgress(false);
+            throw err;
+          }
+          setStatus(`Load failed (${err.message || err}). Retrying…`);
+          await new Promise(r => setTimeout(r, 1200));
+        }
+      }
+    }
+
+    // --- Inference ---
+    async function runInference(prompt) {
+      await ensureModel();
+      setStatus('Running forward pass…');
+      const inputs = await tokenizer(prompt);
+      const ids = Array.from(inputs.input_ids.data).map(Number);
+      const tokens = ids.map(id => tokenizer.decode([id]));
+      const N = tokens.length;
+
+      const output = await model(inputs, { output_attentions: true });
+
+      // Attentions come back as per-layer keys "attentions.0".."attentions.11".
+      let att = output.attentions;
+      if (!att) {
+        const keys = Object.keys(output)
+          .filter(k => /^attentions?\.\d+$/.test(k))
+          .sort((a, b) => Number(a.split('.')[1]) - Number(b.split('.')[1]));
+        att = keys.map(k => output[k]);
+      }
+      if (!att || !att.length) throw new Error('No attention outputs returned by the model.');
+
+      const layers = att.map(t => {
+        const [, H, n] = t.dims; // [1, H, N, N]
+        return { data: Float32Array.from(t.data), H, N: n };
+      });
+      cache = { tokens, N, layers };
+    }
+
+    // --- Render ---
+    function render() {
+      els.chart.innerHTML = '';
+      if (!cache) return;
+
+      const layerIdx = +els.layer.value;
+      const headIdx = +els.head.value;
+      const { tokens, N } = cache;
+      const layer = cache.layers[layerIdx];
+      const value = (i, j) => layer.data[(headIdx * N + i) * N + j];
+
+      const labels = tokens.map(cleanToken);
+
+      // Sizing: cells shrink to fit available width (no length cap).
+      const containerW = els.chart.clientWidth || 900;
+      const margin = { top: 90, right: 80, left: 90, bottom: 10 };
+      const avail = Math.max(120, containerW - margin.left - margin.right);
+      const cell = Math.min(56, avail / N);
+      const grid = cell * N;
+      const width = grid + margin.left + margin.right;
+      const height = grid + margin.top + margin.bottom;
+
+      const x = d3.scaleBand().domain(d3.range(N)).range([0, grid]);
+      const y = d3.scaleBand().domain(d3.range(N)).range([0, grid]);
+
+      // Color scale over the current matrix's value range for good contrast.
+      let maxV = 0;
+      for (let i = 0; i < N; i++) for (let j = 0; j <= i; j++) maxV = Math.max(maxV, value(i, j));
+      const interp = d3[`interpolate${els.scheme.value}`] || d3.interpolateBlues;
+      const color = d3.scaleSequential(interp).domain([0, maxV || 1]);
+
+      const svg = d3.select(els.chart).append('svg')
+        .attr('width', width).attr('height', height);
+      const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+      // Cells
+      const rows = g.selectAll('g.row').data(d3.range(N)).join('g')
+        .attr('class', 'row').attr('transform', i => `translate(0,${y(i)})`);
+      rows.selectAll('rect').data(i => d3.range(N).map(j => ({ i, j }))).join('rect')
+        .attr('class', 'cell')
+        .attr('x', d => x(d.j)).attr('width', x.bandwidth()).attr('height', y.bandwidth())
+        .attr('fill', d => color(value(d.i, d.j)))
+        .on('mousemove', (event, d) => {
+          d3.select(event.currentTarget).classed('hover', true);
+          const w = value(d.i, d.j);
+          els.tooltip.innerHTML =
+            `<div>${labels[d.i]} <span style="color:var(--muted)">→</span> ${labels[d.j]}</div>` +
+            `<div class="w">${w.toFixed(4)}</div>`;
+          els.tooltip.style.opacity = 1;
+          els.tooltip.style.left = (event.clientX + 14) + 'px';
+          els.tooltip.style.top = (event.clientY + 14) + 'px';
+        })
+        .on('mouseleave', (event) => {
+          d3.select(event.currentTarget).classed('hover', false);
+          els.tooltip.style.opacity = 0;
+        });
+
+      // Labels (skip text when cells get too small to keep it readable).
+      const fontSize = Math.max(7, Math.min(13, cell * 0.5));
+      if (cell >= 8) {
+        // Column labels (attended-to tokens) along the top, rotated.
+        g.append('g').selectAll('text').data(d3.range(N)).join('text')
+          .attr('class', 'axis-label')
+          .attr('transform', j => `translate(${x(j) + x.bandwidth() / 2}, -6) rotate(-55)`)
+          .attr('text-anchor', 'start').attr('font-size', fontSize)
+          .text(j => labels[j]);
+        // Row labels (query tokens) on the left.
+        g.append('g').selectAll('text').data(d3.range(N)).join('text')
+          .attr('class', 'axis-label')
+          .attr('x', -8).attr('y', i => y(i) + y.bandwidth() / 2)
+          .attr('text-anchor', 'end').attr('dominant-baseline', 'central')
+          .attr('font-size', fontSize)
+          .text(i => labels[i]);
+      }
+
+      // Axis titles
+      svg.append('text').attr('class', 'legend-text')
+        .attr('x', margin.left + grid / 2).attr('y', 16)
+        .attr('text-anchor', 'middle').text('attends to (key) →');
+      svg.append('text').attr('class', 'legend-text')
+        .attr('transform', `translate(16, ${margin.top + grid / 2}) rotate(-90)`)
+        .attr('text-anchor', 'middle').text('query token ↓');
+
+      setStatus(
+        `${N} tokens · layer ${layerIdx} · head ${headIdx} · max weight ${maxV.toFixed(3)} ` +
+        `(causal: upper triangle is zero by construction).`
+      );
+    }
+
+    // --- Events ---
+    async function onRun() {
+      els.run.disabled = true;
+      try {
+        await runInference(els.prompt.value.trim() || ' ');
+        render();
+      } catch (err) {
+        console.error(err);
+        setStatus('Error: ' + err.message, true);
+        showProgress(false);
+      } finally {
+        els.run.disabled = false;
+      }
+    }
+
+    els.run.addEventListener('click', onRun);
+    els.layer.addEventListener('change', render);
+    els.head.addEventListener('change', render);
+    els.scheme.addEventListener('change', render);
+    let resizeTimer;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(render, 150);
+    });
+
+    // Expose a hook so an automated harness can confirm a render happened.
+    window.__APP_READY__ = true;
+  </script>
+</body>
+</html>

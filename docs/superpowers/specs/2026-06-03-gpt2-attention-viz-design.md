@@ -11,7 +11,8 @@ attention heatmap where rows and columns are tokens and color intensity
 encodes attention weight. Dropdowns select which layer and head to display.
 
 - **Inference:** Transformers.js (`@huggingface/transformers`) running
-  `Xenova/gpt2` (base, 12 layers × 12 heads) entirely client-side.
+  `damoncrockett/gpt2-with-attentions-onnx` (GPT-2 small, 12 layers × 12 heads)
+  entirely client-side.
 - **Visualization:** D3.js heatmap.
 - **Delivery:** One file, `attention-viz.html`. No backend, no build step.
   All dependencies loaded as ES modules from a CDN.
@@ -20,36 +21,36 @@ encodes attention weight. Dropdowns select which layer and head to display.
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Model | `Xenova/gpt2` (base, 12×12) | Canonical GPT-2; gives 12 layers and 12 heads to explore. ~250MB first-load download, cached afterward. |
+| Model | `damoncrockett/gpt2-with-attentions-onnx` (base, 12×12) | GPT-2 small re-exported with attention outputs. **Resolved during the Milestone 1 spike** — the stock `Xenova/gpt2` export exposes no attentions (see updated risk section). 653MB fp32 `model.onnx`, `use_cache=False`. Attentions arrive as per-layer keys `attentions.0`…`attentions.11`. |
 | Prompt length | No cap; cells shrink to fit | Maximum flexibility; user accepts smaller cells for long prompts. |
 | Token labels | Cleaned | Strip the BPE `Ġ` space marker and render a `·` space indicator (e.g. `·dog`) so axis labels read naturally. |
 | Color scheme | TBD — chosen visually after Milestone 1 | Look-and-feel choice; deferred until the spike proves the data is real. |
 
-## The Primary Technical Risk
+## The Primary Technical Risk — RESOLVED (Milestone 1)
 
 Transformers.js's high-level `pipeline()` API does **not** expose attention
-weights. Attentions are only available if **both**:
+weights, and the stock `Xenova/gpt2` ONNX export does not include attention
+tensors in its output graph (its outputs are only `logits` + the `present.N.*`
+KV cache). The Milestone 1 spike confirmed this empirically, then resolved it.
 
-1. We call the model directly via `AutoModelForCausalLM` and pass
-   `output_attentions: true` to the forward call, **and**
-2. The ONNX export of `Xenova/gpt2` actually includes attention tensors in its
-   output graph.
+**Resolution:** `damoncrockett/gpt2-with-attentions-onnx` is a community
+re-export of GPT-2 small with `output_attentions=True` and `use_cache=False`
+baked into the graph. Verified working in-browser via Transformers.js:
 
-Whether (2) holds for the stock export is unknown until tested. This is why the
-build is gated: **Milestone 1 is a pure feasibility spike that must pass before
-any UI is written.**
+- ONNX outputs: `logits`, `attentions.0` … `attentions.11`
+- 12 attention tensors (one per layer), each `[1, 12, N, N]`
+  = `[batch, heads, seq, seq]`
+- Layer 0 / head 0 for "The cat sat on the mat" was lower-triangular (causal)
+  with every row summing to ~1.0 — a valid softmax attention matrix.
 
-Possible outcomes:
+**Caveats carried into Milestone 2:**
 
-- **A (best case):** `Xenova/gpt2` already exports attentions. Running with
-  `{ output_attentions: true }` returns an `attentions` array of 12 tensors,
-  each shaped `[batch=1, heads=12, seq, seq]`. This is the first thing to test.
-- **B:** Export lacks attentions but a specific revision/subfolder or option
-  enables them. Fallback if A fails.
-- **C (worst case):** No usable attention output is available. We would have to
-  reconstruct attention manually from hidden states and QK projections — a
-  much larger effort. If we land here, **stop and reassess scope** rather than
-  silently building it.
+- Attentions are returned as **separate per-layer keys** (`attentions.N`), not a
+  single array — the app reconstructs the ordered `[layer][head][N][N]`
+  structure itself.
+- The model is a **653MB fp32 download** (no quantized variant published). The
+  first browser fetch can throw a transient `Failed to fetch`; the loader needs
+  a **progress indicator and retry**.
 
 ## Architecture
 
@@ -112,8 +113,9 @@ model, run one forward pass with `output_attentions: true`, and `console.log`:
 - **Heatmap:** two band scales (token index → x/y) and a sequential color scale
   for weight. Axis labels are cleaned tokens. Cells shrink to fit (no length
   cap). Hover tooltip shows `rowToken → colToken` and the weight value.
-- **States:** model-loading indicator (first load downloads ~250MB), running
-  indicator, and an error display.
+- **States:** model-loading indicator with progress (first load downloads
+  ~653MB) and retry on transient fetch failure, a running indicator, and an
+  error display.
 
 ## Out of Scope (YAGNI)
 
