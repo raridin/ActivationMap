@@ -44,7 +44,7 @@ python3 -m http.server 8123
 
 ---
 
-## How it works (and one gotcha)
+## How it works
 
 Transformers.js's high-level `pipeline()` API does **not** expose attention
 weights, and — importantly — the standard [`Xenova/gpt2`] ONNX export doesn't
